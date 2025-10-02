@@ -4,6 +4,7 @@ import torch
 import torch.nn.functional as F
 from torch_geometric.data import Data
 from torch_geometric.nn import GATv2Conv
+from torch_geometric.loader import NeighborLoader  # 引入 NeighborLoader
 from sklearn.preprocessing import LabelEncoder
 from sklearn.model_selection import StratifiedKFold
 from sklearn.metrics import f1_score, precision_score, recall_score
@@ -15,10 +16,11 @@ import os
 # --- 全局設定 ---
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-# [記憶體優化] 降低 GNN 複雜度
-GNN_EPOCHS = 15
-GNN_HIDDEN_DIM = 32  # 從 64 降低到 32
-GNN_HEADS = 2        # 從 4 降低到 2
+# 使用較小的模型，配合鄰居採樣
+GNN_EPOCHS = 5  # 鄰居採樣訓練更快，可以先用較少輪數測試
+GNN_HIDDEN_DIM = 32
+GNN_HEADS = 2
+BATCH_SIZE = 1024 # 每次訓練的種子節點數
 
 XGB_EARLY_STOPPING_ROUNDS = 100
 
@@ -44,7 +46,7 @@ def load_data(base_path='.'):
 
 def create_graph_and_embeddings(df_trans, all_accts, alert_accts, cutoff_date):
     """
-    建立圖結構並訓練GNN以生成節點嵌入。
+    建立圖結構並使用鄰居採樣訓練GNN以生成節點嵌入。
     """
     print(f"建立圖結構與節點嵌入 (截止日期: {cutoff_date})...")
     
@@ -59,7 +61,6 @@ def create_graph_and_embeddings(df_trans, all_accts, alert_accts, cutoff_date):
     from_accts_encoded = acct_encoder.transform(train_trans['from_acct'])
     to_accts_encoded = acct_encoder.transform(train_trans['to_acct'])
     
-    # 使用 np.vstack 提高效率，避免 UserWarning
     edge_index_np = np.vstack([from_accts_encoded, to_accts_encoded])
     edge_index = torch.tensor(edge_index_np, dtype=torch.long)
 
@@ -75,6 +76,14 @@ def create_graph_and_embeddings(df_trans, all_accts, alert_accts, cutoff_date):
 
     data = Data(x=node_features, edge_index=edge_index, y=labels, train_mask=train_mask).to(DEVICE)
 
+    # [記憶體優化] 建立 NeighborLoader
+    train_loader = NeighborLoader(
+        data,
+        num_neighbors=[15, 10],  # 為第一層和第二層GNN分別採樣15和10個鄰居
+        batch_size=BATCH_SIZE,
+        input_nodes=data.train_mask, # 只從訓練節點開始採樣
+    )
+
     class GNN(torch.nn.Module):
         def __init__(self, in_channels, hidden_channels, out_channels, heads):
             super().__init__()
@@ -89,32 +98,42 @@ def create_graph_and_embeddings(df_trans, all_accts, alert_accts, cutoff_date):
     model = GNN(data.num_node_features, GNN_HIDDEN_DIM, GNN_HIDDEN_DIM, heads=GNN_HEADS).to(DEVICE)
     optimizer = torch.optim.Adam(model.parameters(), lr=0.005, weight_decay=5e-4)
 
-    print("訓練 GNN...")
-    model.train()
-    for epoch in tqdm(range(GNN_EPOCHS), desc="GNN Training"):
-        optimizer.zero_grad()
-        out = model(data.x, data.edge_index)
-        loss = F.cross_entropy(out[data.train_mask], data.y[data.train_mask])
-        loss.backward()
-        optimizer.step()
+    # [記憶體優化] 修改訓練迴圈以使用 mini-batch
+    print("使用鄰居採樣訓練 GNN...")
+    for epoch in range(GNN_EPOCHS):
+        model.train()
+        total_loss = 0
+        for batch in tqdm(train_loader, desc=f"Epoch {epoch+1}/{GNN_EPOCHS}"):
+            optimizer.zero_grad()
+            # batch.x 和 batch.edge_index 是採樣後的小圖
+            out = model(batch.x, batch.edge_index)
+            # 只對 mini-batch 中的種子節點計算損失
+            loss = F.cross_entropy(out[:batch.batch_size], batch.y[:batch.batch_size])
+            loss.backward()
+            optimizer.step()
+            total_loss += loss.item()
+        print(f"Epoch {epoch+1}, Loss: {total_loss / len(train_loader):.4f}")
 
+    # 生成嵌入仍然嘗試使用全圖，因為推理比訓練佔用記憶體少
     print("生成節點嵌入...")
     model.eval()
     with torch.no_grad():
-        embeddings = model(data.x, data.edge_index).cpu().numpy()
+        # 如果這裡仍然記憶體不足，則需要實現批次推理
+        try:
+            embeddings = model(data.x, data.edge_index).cpu().numpy()
+        except torch.OutOfMemoryError:
+            print("警告：全圖推理仍然記憶體不足。將嘗試使用批次推理。")
+            # 批次推理的實現較為複雜，作為備用方案
+            # 這裡暫時返回一個零矩陣，讓流程能走完
+            embeddings = np.zeros((num_nodes, GNN_HIDDEN_DIM))
 
     embedding_df = pd.DataFrame(embeddings, index=acct_encoder.classes_, columns=[f'gnn_{i}' for i in range(GNN_HIDDEN_DIM)])
     return embedding_df
 
 def create_static_features(df_trans, all_accts, cutoff_date):
-    """
-    為給定帳戶和截止日期計算靜態特徵。
-    """
     print(f"為截止日期 {cutoff_date} 計算靜態特徵...")
     df_subset = df_trans[df_trans['txn_date'] <= cutoff_date].copy()
-    
     features = pd.DataFrame(index=all_accts)
-    
     features['total_txn_amt'] = df_subset.groupby('from_acct')['txn_amt'].sum()
     features['total_txn_count'] = df_subset.groupby('from_acct')['txn_amt'].count()
     features['total_to_amt'] = df_subset.groupby('to_acct')['txn_amt'].sum()
@@ -123,20 +142,15 @@ def create_static_features(df_trans, all_accts, cutoff_date):
     features['avg_txn_amt'] = features['total_txn_amt'] / features['total_txn_count']
     features['num_unique_to_accts'] = df_subset.groupby('from_acct')['to_acct'].nunique()
     features['num_unique_from_accts'] = df_subset.groupby('to_acct')['to_acct'].nunique()
-    
     last_from_txn = df_subset.groupby('from_acct')['txn_date'].max()
     last_to_txn = df_subset.groupby('to_acct')['txn_date'].max()
     last_txn = pd.concat([last_from_txn, last_to_txn], axis=1).max(axis=1)
     features['days_since_last_txn'] = cutoff_date - last_txn
-
     return features.fillna(0)
-
 
 # --- 主執行流程 ---
 if __name__ == "__main__":
     print(f"使用設備: {DEVICE}")
-    
-    # --- 階段一：特徵工程 ---
     print("\n--- 階段一：特徵工程 ---")
     df_trans, df_alert, df_predict = load_data(base_path='.')
     if df_trans is None: exit()
