@@ -14,8 +14,12 @@ import os
 
 # --- 全局設定 ---
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-GNN_EPOCHS = 15  # 適度增加 GNN 訓練輪數
-GNN_HIDDEN_DIM = 64
+
+# [記憶體優化] 降低 GNN 複雜度
+GNN_EPOCHS = 15
+GNN_HIDDEN_DIM = 32  # 從 64 降低到 32
+GNN_HEADS = 2        # 從 4 降低到 2
+
 XGB_EARLY_STOPPING_ROUNDS = 100
 
 # --- 階段一：特徵工程函數 ---
@@ -24,7 +28,6 @@ def load_data(base_path='.'):
     """載入所有需要的資料集"""
     print("正在載入資料...")
     
-    # 定義檔案路徑
     path_trans = os.path.join(base_path, 'acct_transaction.csv')
     path_alert = os.path.join(base_path, 'acct_alert.csv')
     path_predict = os.path.join(base_path, 'acct_predict.csv')
@@ -42,7 +45,6 @@ def load_data(base_path='.'):
 def create_graph_and_embeddings(df_trans, all_accts, alert_accts, cutoff_date):
     """
     建立圖結構並訓練GNN以生成節點嵌入。
-    [防洩漏審查]：此函數只使用 cutoff_date 之前的交易來建構圖，確保GNN模型訓練時看不到未來資訊。
     """
     print(f"建立圖結構與節點嵌入 (截止日期: {cutoff_date})...")
     
@@ -56,7 +58,10 @@ def create_graph_and_embeddings(df_trans, all_accts, alert_accts, cutoff_date):
 
     from_accts_encoded = acct_encoder.transform(train_trans['from_acct'])
     to_accts_encoded = acct_encoder.transform(train_trans['to_acct'])
-    edge_index = torch.tensor([from_accts_encoded, to_accts_encoded], dtype=torch.long)
+    
+    # 使用 np.vstack 提高效率，避免 UserWarning
+    edge_index_np = np.vstack([from_accts_encoded, to_accts_encoded])
+    edge_index = torch.tensor(edge_index_np, dtype=torch.long)
 
     node_features = torch.zeros(num_nodes, 1)
     known_alert_accts = [acct for acct in alert_accts if acct in acct_encoder.classes_]
@@ -71,17 +76,17 @@ def create_graph_and_embeddings(df_trans, all_accts, alert_accts, cutoff_date):
     data = Data(x=node_features, edge_index=edge_index, y=labels, train_mask=train_mask).to(DEVICE)
 
     class GNN(torch.nn.Module):
-        def __init__(self, in_channels, hidden_channels, out_channels):
+        def __init__(self, in_channels, hidden_channels, out_channels, heads):
             super().__init__()
-            self.conv1 = GATv2Conv(in_channels, hidden_channels, heads=4, concat=True, dropout=0.6)
-            self.conv2 = GATv2Conv(hidden_channels * 4, out_channels, heads=1, concat=False, dropout=0.6)
+            self.conv1 = GATv2Conv(in_channels, hidden_channels, heads=heads, concat=True, dropout=0.6)
+            self.conv2 = GATv2Conv(hidden_channels * heads, out_channels, heads=1, concat=False, dropout=0.6)
 
         def forward(self, x, edge_index):
             x = F.elu(self.conv1(x, edge_index))
             x = self.conv2(x, edge_index)
             return x
 
-    model = GNN(data.num_node_features, GNN_HIDDEN_DIM, GNN_HIDDEN_DIM).to(DEVICE)
+    model = GNN(data.num_node_features, GNN_HIDDEN_DIM, GNN_HIDDEN_DIM, heads=GNN_HEADS).to(DEVICE)
     optimizer = torch.optim.Adam(model.parameters(), lr=0.005, weight_decay=5e-4)
 
     print("訓練 GNN...")
@@ -104,7 +109,6 @@ def create_graph_and_embeddings(df_trans, all_accts, alert_accts, cutoff_date):
 def create_static_features(df_trans, all_accts, cutoff_date):
     """
     為給定帳戶和截止日期計算靜態特徵。
-    [防洩漏審查]：此函數只使用 cutoff_date 之前的交易，嚴格防止特徵洩漏。
     """
     print(f"為截止日期 {cutoff_date} 計算靜態特徵...")
     df_subset = df_trans[df_trans['txn_date'] <= cutoff_date].copy()
@@ -134,18 +138,15 @@ if __name__ == "__main__":
     
     # --- 階段一：特徵工程 ---
     print("\n--- 階段一：特徵工程 ---")
-    # 假設腳本與資料檔案位於同一目錄下
-    df_trans, df_alert, df_predict = load_data()
+    df_trans, df_alert, df_predict = load_data(base_path='.')
     if df_trans is None: exit()
 
-    # [防洩漏關鍵點]：定義時間切點
     train_cutoff_date = df_alert['event_date'].max()
     test_cutoff_date = df_trans['txn_date'].max()
     print(f"訓練集截止日期 (train_cutoff_date): {train_cutoff_date}")
     print(f"測試集截止日期 (test_cutoff_date): {test_cutoff_date}")
 
     train_accts = df_alert['acct'].unique()
-    # **修正點**: 從 acct_predict.csv 讀取測試帳戶
     test_accts = df_predict['acct'].unique()
     all_accts = np.unique(np.concatenate([train_accts, test_accts, df_trans['from_acct'].unique(), df_trans['to_acct'].unique()]))
     
