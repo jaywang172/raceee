@@ -1,4 +1,3 @@
-
 import pandas as pd
 import numpy as np
 import torch
@@ -11,32 +10,33 @@ from sklearn.metrics import f1_score, precision_score, recall_score
 from tqdm import tqdm
 import xgboost as xgb
 import gc
+import os
 
 # --- 全局設定 ---
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-GNN_EPOCHS = 10
+GNN_EPOCHS = 15  # 適度增加 GNN 訓練輪數
 GNN_HIDDEN_DIM = 64
 XGB_EARLY_STOPPING_ROUNDS = 100
 
 # --- 階段一：特徵工程函數 ---
 
-def load_data():
+def load_data(base_path='.'):
     """載入所有需要的資料集"""
     print("正在載入資料...")
+    
+    # 定義檔案路徑
+    path_trans = os.path.join(base_path, 'acct_transaction.csv')
+    path_alert = os.path.join(base_path, 'acct_alert.csv')
+    path_predict = os.path.join(base_path, 'acct_predict.csv')
+
     try:
-        # 假設腳本在 '初賽資料' 目錄中執行
-        df_trans = pd.read_csv('acct_transaction.csv')
-        df_alert = pd.read_csv('acct_alert.csv')
-        df_predict = pd.read_csv('../submission_template.csv') # 範本在上一層
-    except FileNotFoundError:
-        print("在當前目錄找不到檔案，嘗試從 '初賽資料/' 子目錄讀取...")
-        try:
-            df_trans = pd.read_csv('初賽資料/acct_transaction.csv')
-            df_alert = pd.read_csv('初賽資料/acct_alert.csv')
-            df_predict = pd.read_csv('submission_template.csv')
-        except FileNotFoundError as e:
-            print(f"錯誤：找不到必要的 CSV 檔案: {e.filename}。請確認資料檔案位置。")
-            return None, None, None
+        df_trans = pd.read_csv(path_trans)
+        df_alert = pd.read_csv(path_alert)
+        df_predict = pd.read_csv(path_predict)
+    except FileNotFoundError as e:
+        print(f"錯誤：找不到必要的 CSV 檔案: {e.filename}。請確認資料檔案都在腳本的同一目錄下。")
+        return None, None, None
+            
     return df_trans, df_alert, df_predict
 
 def create_graph_and_embeddings(df_trans, all_accts, alert_accts, cutoff_date):
@@ -134,15 +134,18 @@ if __name__ == "__main__":
     
     # --- 階段一：特徵工程 ---
     print("\n--- 階段一：特徵工程 ---")
+    # 假設腳本與資料檔案位於同一目錄下
     df_trans, df_alert, df_predict = load_data()
     if df_trans is None: exit()
 
+    # [防洩漏關鍵點]：定義時間切點
     train_cutoff_date = df_alert['event_date'].max()
     test_cutoff_date = df_trans['txn_date'].max()
     print(f"訓練集截止日期 (train_cutoff_date): {train_cutoff_date}")
     print(f"測試集截止日期 (test_cutoff_date): {test_cutoff_date}")
 
     train_accts = df_alert['acct'].unique()
+    # **修正點**: 從 acct_predict.csv 讀取測試帳戶
     test_accts = df_predict['acct'].unique()
     all_accts = np.unique(np.concatenate([train_accts, test_accts, df_trans['from_acct'].unique(), df_trans['to_acct'].unique()]))
     
@@ -169,7 +172,6 @@ if __name__ == "__main__":
     # --- 階段二：XGBoost 模型訓練與預測 ---
     print("\n--- 階段二：XGBoost 模型訓練與預測 ---")
     
-    # 確保欄位順序一致
     X_test = X_test[X_train.columns]
 
     model = xgb.XGBClassifier(
@@ -227,7 +229,7 @@ if __name__ == "__main__":
     submission = pd.DataFrame({'acct': X_test.index, 'label': predictions})
     
     if submission['label'].sum() == 0:
-        print("警告：模型在最佳門檻值下沒有預測出任何正樣本。為確保有提交，將使用一個較低的門檻值(0.1)重試。")
+        print("警告：模型在最佳門檻值下沒有預測出任何正樣本。將使用一個較低的門檻值(0.1)重試。")
         predictions = (sub_preds > 0.1).astype(int)
         submission['label'] = predictions
 
@@ -235,6 +237,6 @@ if __name__ == "__main__":
 
     print("\n=======================================")
     print(f"流程成功結束！")
-    print(f"提交檔案 'submission.csv' 已生成。")
+    print(f"提交檔案 'submission.csv' 已生成於目前目錄下。")
     print(f"預測出 {submission['label'].sum()} 個警示帳戶。")
     print("=======================================")
