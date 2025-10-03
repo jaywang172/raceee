@@ -111,10 +111,10 @@ def create_static_features(df_trans, all_accts, cutoff_date):
     features['avg_txn_amt'] = features['total_txn_amt'] / features['total_txn_count']
     features['num_unique_to_accts'] = df_subset.groupby('from_acct')['to_acct'].nunique()
     features['num_unique_from_accts'] = df_subset.groupby('to_acct')['to_acct'].nunique()
-    last_from_txn = df_subset.groupby('from_acct')['txn_date'].max()
-    last_to_txn = df_subset.groupby('to_acct')['txn_date'].max()
-    last_txn = pd.concat([last_from_txn, last_to_txn], axis=1).max(axis=1)
-    features['days_since_last_txn'] = cutoff_date - last_txn
+    # last_from_txn = df_subset.groupby('from_acct')['txn_date'].max()
+    # last_to_txn = df_subset.groupby('to_acct')['txn_date'].max()
+    # last_txn = pd.concat([last_from_txn, last_to_txn], axis=1).max(axis=1)
+    # features['days_since_last_txn'] = cutoff_date - last_txn
     return features.fillna(0)
 
 if __name__ == "__main__":
@@ -177,7 +177,13 @@ if __name__ == "__main__":
             verbose=500
         )
         oof_preds[valid_idx] = model.predict_proba(X_valid_fold)[:, 1]
-        sub_preds += model.predict_proba(X_test)[:, 1] / folds.n_splits
+    sub_preds += model.predict_proba(X_test)[:, 1] / folds.n_splits
+
+    # Save raw prediction scores for analysis
+    score_df = pd.DataFrame({'acct': X_test.index, 'score': sub_preds})
+    score_df.to_csv('prediction_scores.csv', index=False)
+    print("\n原始預測分數已儲存至 'prediction_scores.csv'")
+
 
     print("\n在 OOF 預測上尋找最佳 F1 門檻值...")
     best_f1 = 0
