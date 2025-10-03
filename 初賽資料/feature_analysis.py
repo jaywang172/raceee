@@ -43,7 +43,8 @@ features_df['diff_from_mean_amt_3d_vs_30d'] = features_df['from_amt_mean_3d'] - 
 print("\nGenerating categorical and behavioral features...")
 
 # Convert time to a numerical format for comparison
-df_trans['txn_time_num'] = df_trans['txn_time'] // 10000 * 3600 + (df_trans['txn_time'] % 10000) // 100 * 60 + df_trans['txn_time'] % 100
+dt_series = pd.to_datetime(df_trans['txn_time'], format='%H:%M:%S', errors='coerce')
+df_trans['txn_time_num'] = (dt_series - dt_series.dt.normalize()).dt.total_seconds().fillna(0)
 
 # Group by account to calculate new features
 grouped_from = df_trans.groupby('from_acct')
