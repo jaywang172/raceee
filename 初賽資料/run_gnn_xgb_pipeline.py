@@ -142,7 +142,7 @@ if __name__ == "__main__":
     X_train = train_full_features.loc[train_pool_accts]
     y_train = labels.loc[train_pool_accts]['label']
     X_test = test_full_features.loc[test_accts]
-    del df_trans, gnn_embeddings, train_static_features, test_static_features, train_full_features, test_full_features
+    del df_trans, train_static_features, test_static_features, train_full_features, test_full_features
     gc.collect()
     print("特徵工程完成！")
 
