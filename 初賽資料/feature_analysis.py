@@ -7,7 +7,7 @@ import warnings
 warnings.filterwarnings("ignore", category=UserWarning)
 
 # --- Part 1: Setup & Data Loading ---
-print("--- Comprehensive Feature Importance Analysis ---")
+print("--- Comprehensive Feature Importance Analysis (v3) ---")
 print("Loading data...")
 try:
     df_trans = pd.read_csv('acct_transaction.csv')
@@ -39,54 +39,53 @@ features_df['ratio_from_amt_3d_vs_30d'] = features_df['from_amt_sum_3d'] / (feat
 features_df['ratio_from_cnt_1d_vs_7d'] = features_df['from_count_1d'] / (features_df['from_count_7d'] + epsilon)
 features_df['diff_from_mean_amt_3d_vs_30d'] = features_df['from_amt_mean_3d'] - features_df['from_amt_mean_30d']
 
-# --- Part 3: Categorical & Behavioral Feature Engineering ---
-print("\nGenerating categorical and behavioral features...")
+# --- Part 3: Advanced Behavioral & Network Features ---
+print("\nGenerating advanced behavioral and network features...")
 
-# Convert time to a numerical format for comparison
+# 3.1 Basic Behavioral Features
 dt_series = pd.to_datetime(df_trans['txn_time'], format='%H:%M:%S', errors='coerce')
 df_trans['txn_time_num'] = (dt_series - dt_series.dt.normalize()).dt.total_seconds().fillna(0)
 
-# Group by account to calculate new features
 grouped_from = df_trans.groupby('from_acct')
 grouped_to = df_trans.groupby('to_acct')
 
-# Calculate total transactions for normalization
 total_txns_from = grouped_from.size().reindex(features_df.index).fillna(0)
 total_txns_to = grouped_to.size().reindex(features_df.index).fillna(0)
 total_txns = total_txns_from + total_txns_to
 
-# 3.1 Night Transaction Ratio
-is_night_txn = (df_trans['txn_time_num'] < 6 * 3600) # Before 6 AM
-night_txns_from = df_trans[is_night_txn].groupby('from_acct').size().reindex(features_df.index).fillna(0)
-night_txns_to = df_trans[is_night_txn].groupby('to_acct').size().reindex(features_df.index).fillna(0)
-features_df['night_txn_ratio'] = (night_txns_from + night_txns_to) / (total_txns + epsilon)
+features_df['night_txn_ratio'] = (df_trans[df_trans['txn_time_num'] < 6 * 3600].groupby('from_acct').size() + df_trans[df_trans['txn_time_num'] < 6 * 3600].groupby('to_acct').size()).reindex(features_df.index).fillna(0) / (total_txns + epsilon)
+features_df['self_txn_ratio'] = (df_trans[df_trans['is_self_txn'] == 'Y'].groupby('from_acct').size() + df_trans[df_trans['is_self_txn'] == 'Y'].groupby('to_acct').size()).reindex(features_df.index).fillna(0) / (total_txns + epsilon)
 
-# 3.2 Self Transaction Ratio
-is_self_txn = (df_trans['is_self_txn'] == 'Y')
-self_txns_from = df_trans[is_self_txn].groupby('from_acct').size().reindex(features_df.index).fillna(0)
-self_txns_to = df_trans[is_self_txn].groupby('to_acct').size().reindex(features_df.index).fillna(0)
-features_df['self_txn_ratio'] = (self_txns_from + self_txns_to) / (total_txns + epsilon)
-
-# 3.3 Inter-Bank Transaction Ratio
-is_inter_bank_from = (df_trans['to_acct_type'] == '02')
-inter_bank_from = df_trans[is_inter_bank_from].groupby('from_acct').size().reindex(features_df.index).fillna(0)
-features_df['inter_bank_out_ratio'] = inter_bank_from / (total_txns_from + epsilon)
-
-is_inter_bank_to = (df_trans['from_acct_type'] == '02')
-inter_bank_to = df_trans[is_inter_bank_to].groupby('to_acct').size().reindex(features_df.index).fillna(0)
-features_df['inter_bank_in_ratio'] = inter_bank_to / (total_txns_to + epsilon)
-
-# 3.4 Channel Type Ratios
 channel_dummies = pd.get_dummies(df_trans['channel_type'], prefix='channel')
-channel_df = pd.concat([df_trans[['from_acct', 'to_acct']], channel_dummies], axis=1)
-
-channel_from = channel_df.groupby('from_acct')[channel_dummies.columns].sum().reindex(features_df.index).fillna(0)
-channel_to = channel_df.groupby('to_acct')[channel_dummies.columns].sum().reindex(features_df.index).fillna(0)
-channel_total = channel_from + channel_to
-
+channel_total = pd.concat([df_trans[['from_acct', 'to_acct']], channel_dummies], axis=1).groupby('from_acct')[channel_dummies.columns].sum() + pd.concat([df_trans[['from_acct', 'to_acct']], channel_dummies], axis=1).groupby('to_acct')[channel_dummies.columns].sum()
 for col in channel_dummies.columns:
-    features_df[f'{col}_ratio'] = channel_total[col] / (total_txns + epsilon)
+    features_df[f'{col}_ratio'] = channel_total[col].reindex(features_df.index).fillna(0) / (total_txns + epsilon)
 
+# 3.2 New Network & Granular Features
+print("\nGenerating new features (unique partners, amount ratios, lifecycle)...")
+
+# Unique partners
+features_df['unique_from_acct_count'] = grouped_from['to_acct'].nunique().reindex(features_df.index).fillna(0)
+features_df['unique_to_acct_count'] = grouped_to['from_acct'].nunique().reindex(features_df.index).fillna(0)
+
+# Max vs Mean amount
+from_max_mean = grouped_from['txn_amt'].agg(['max', 'mean'])
+from_max_mean.columns = ['from_max_amt', 'from_mean_amt']
+features_df = features_df.join(from_max_mean, how='left')
+features_df['from_max_vs_mean_ratio'] = features_df['from_max_amt'] / (features_df['from_mean_amt'] + epsilon)
+
+# Account lifecycle
+first_txn_from = grouped_from['txn_date'].min().reindex(features_df.index)
+first_txn_to = grouped_to['txn_date'].min().reindex(features_df.index)
+features_df['first_txn_date'] = pd.concat([first_txn_from, first_txn_to], axis=1).min(axis=1)
+features_df['days_since_first_txn'] = latest_date - features_df['first_txn_date']
+
+# Round number transactions
+round_num_from = df_trans[df_trans['txn_amt'] % 1000 == 0].groupby('from_acct').size().reindex(features_df.index).fillna(0)
+round_num_to = df_trans[df_trans['txn_amt'] % 1000 == 0].groupby('to_acct').size().reindex(features_df.index).fillna(0)
+features_df['round_number_txn_ratio'] = (round_num_from + round_num_to) / (total_txns + epsilon)
+
+features_df.fillna(0, inplace=True)
 
 # --- Part 4: Model Training for Feature Analysis ---
 print("\n--- Part 4: Training Model for Feature Importance Analysis ---")
