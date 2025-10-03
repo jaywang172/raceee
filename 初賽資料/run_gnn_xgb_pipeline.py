@@ -131,12 +131,13 @@ if __name__ == "__main__":
     all_accts = np.unique(np.concatenate([train_accts, test_accts, df_trans['from_acct'].unique(), df_trans['to_acct'].unique()]))
     labels = pd.DataFrame(index=all_accts)
     labels['label'] = np.isin(labels.index, train_accts).astype(int)
-    gnn_embeddings = create_graph_and_embeddings(df_trans, all_accts, train_accts, train_cutoff_date)
+    print("\n!!! GNN 已被禁用，使用純靜態特徵作為基準模型 !!!")
+    # gnn_embeddings = create_graph_and_embeddings(df_trans, all_accts, train_accts, train_cutoff_date)
     train_static_features = create_static_features(df_trans, all_accts, train_cutoff_date)
     test_static_features = create_static_features(df_trans, all_accts, test_cutoff_date)
     print("合併特徵...")
-    train_full_features = train_static_features.join(gnn_embeddings, how='left').fillna(0)
-    test_full_features = test_static_features.join(gnn_embeddings, how='left').fillna(0)
+    train_full_features = train_static_features
+    test_full_features = test_static_features
     train_pool_accts = train_full_features.index.difference(test_accts)
     X_train = train_full_features.loc[train_pool_accts]
     y_train = labels.loc[train_pool_accts]['label']
