@@ -7,7 +7,7 @@ import warnings
 warnings.filterwarnings("ignore", category=UserWarning)
 
 # --- Part 1: Setup & Data Loading ---
-print("--- Comprehensive Feature Importance Analysis (v4) ---")
+print("--- Comprehensive Feature Importance Analysis (v4 - LEAKAGE FIXED) ---")
 print("Loading data...")
 try:
     df_trans = pd.read_csv('acct_transaction.csv')
@@ -48,11 +48,6 @@ epsilon = 1e-6
 features_df['night_txn_ratio'] = (df_trans[pd.to_datetime(df_trans['txn_time'], format='%H:%M:%S', errors='coerce').dt.hour < 6].groupby('from_acct').size() + df_trans[pd.to_datetime(df_trans['txn_time'], format='%H:%M:%S', errors='coerce').dt.hour < 6].groupby('to_acct').size()).reindex(features_df.index).fillna(0) / (total_txns + epsilon)
 features_df['unique_from_acct_count'] = grouped_from['to_acct'].nunique().reindex(features_df.index).fillna(0)
 features_df['unique_to_acct_count'] = grouped_to['from_acct'].nunique().reindex(features_df.index).fillna(0)
-
-first_txn_from = grouped_from['txn_date'].min().reindex(features_df.index)
-first_txn_to = grouped_to['txn_date'].min().reindex(features_df.index)
-features_df['first_txn_date'] = pd.concat([first_txn_from, first_txn_to], axis=1).min(axis=1)
-features_df['days_since_first_txn'] = latest_date - features_df['first_txn_date']
 
 features_df.fillna(0, inplace=True)
 
