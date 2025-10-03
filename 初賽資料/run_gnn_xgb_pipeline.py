@@ -137,8 +137,9 @@ if __name__ == "__main__":
     print("合併特徵...")
     train_full_features = train_static_features.join(gnn_embeddings, how='left').fillna(0)
     test_full_features = test_static_features.join(gnn_embeddings, how='left').fillna(0)
-    X_train = train_full_features.loc[train_accts]
-    y_train = labels.loc[train_accts]['label']
+    train_pool_accts = train_full_features.index.difference(test_accts)
+    X_train = train_full_features.loc[train_pool_accts]
+    y_train = labels.loc[train_pool_accts]['label']
     X_test = test_full_features.loc[test_accts]
     del df_trans, gnn_embeddings, train_static_features, test_static_features, train_full_features, test_full_features
     gc.collect()
