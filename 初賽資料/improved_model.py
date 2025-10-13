@@ -219,10 +219,16 @@ def create_advanced_features(df_trans, accts, cutoff_date, for_training=True):
 # ============================================================================
 # GNN WITH STRUCTURAL FEATURES ONLY (NO LABELS!)
 # ============================================================================
-def create_gnn_embeddings(df_trans, accts, cutoff_date):
+def create_gnn_embeddings(df_trans, accts, cutoff_date, excluded_accts=None):
     """
     Create GNN embeddings using ONLY structural features (NO labels!)
     Memory-efficient version using mini-batch training
+
+    Args:
+        df_trans: transaction dataframe
+        accts: accounts to create embeddings for
+        cutoff_date: only use transactions up to this date
+        excluded_accts: accounts to EXCLUDE from the graph (to prevent leakage)
     """
     if not USE_GNN:
         print("GNN disabled, returning zero embeddings")
@@ -232,6 +238,12 @@ def create_gnn_embeddings(df_trans, accts, cutoff_date):
 
     # Build graph from transactions up to cutoff
     df_subset = df_trans[df_trans['txn_date'] <= cutoff_date].copy()
+
+    # IMPORTANT: Exclude test accounts from graph to prevent leakage
+    if excluded_accts is not None:
+        print(f"[GNN] Excluding {len(excluded_accts):,} accounts from graph to prevent leakage")
+        mask = ~(df_subset['from_acct'].isin(excluded_accts) | df_subset['to_acct'].isin(excluded_accts))
+        df_subset = df_subset[mask]
 
     # Encode accounts
     from sklearn.preprocessing import LabelEncoder
@@ -299,18 +311,19 @@ def create_gnn_embeddings(df_trans, accts, cutoff_date):
 
     model = GNN(x.shape[1], GNN_HIDDEN_DIM, GNN_HIDDEN_DIM, heads=GNN_HEADS).to(DEVICE)
 
-    # Use DataParallel for multi-GPU training
-    if USE_MULTI_GPU:
-        print(f"[GNN] Using DataParallel across {NUM_GPUS} GPUs")
-        model = torch.nn.DataParallel(model)
+    # NOTE: DataParallel doesn't work well with PyG NeighborLoader
+    # Instead, we use larger batch sizes to utilize GPU better
+    # if USE_MULTI_GPU:
+    #     print(f"[GNN] Using DataParallel across {NUM_GPUS} GPUs")
+    #     model = torch.nn.DataParallel(model)
 
     # ========================================
     # MINI-BATCH TRAINING WITH NEIGHBOR SAMPLING
     # ========================================
     print("[GNN] Training with mini-batch neighbor sampling...")
 
-    # Adjust batch size for multi-GPU
-    effective_batch_size = 1024 * max(1, NUM_GPUS // 2)  # Scale batch size with GPUs
+    # Use larger batch size to better utilize GPU memory
+    effective_batch_size = 2048 if NUM_GPUS > 0 else 512
 
     # Create mini-batch loader with neighbor sampling
     # Sample 15 neighbors per node in each layer
@@ -319,7 +332,7 @@ def create_gnn_embeddings(df_trans, accts, cutoff_date):
         num_neighbors=[15, 10, 5],  # 3-hop neighbors
         batch_size=effective_batch_size,
         shuffle=True,
-        num_workers=4,  # Use multiple workers for data loading
+        num_workers=0,  # Set to 0 to avoid multiprocessing issues
     )
 
     optimizer = torch.optim.Adam(model.parameters(), lr=0.001, weight_decay=5e-4)
@@ -379,8 +392,8 @@ def create_gnn_embeddings(df_trans, accts, cutoff_date):
     print("[GNN] Generating embeddings in batches...")
     model.eval()
 
-    # Larger batch size for inference with multi-GPU
-    inference_batch_size = 2048 * max(1, NUM_GPUS // 2)
+    # Larger batch size for inference
+    inference_batch_size = 4096 if NUM_GPUS > 0 else 1024
 
     # Create inference loader (larger batches, no sampling)
     inference_loader = NeighborLoader(
@@ -388,7 +401,7 @@ def create_gnn_embeddings(df_trans, accts, cutoff_date):
         num_neighbors=[-1],  # Use all neighbors for final embedding
         batch_size=inference_batch_size,
         shuffle=False,
-        num_workers=4,
+        num_workers=0,
     )
 
     all_embeddings = []
@@ -468,8 +481,13 @@ test_features = create_advanced_features(df_trans, test_accts, test_cutoff)
 # GNN embeddings
 if USE_GNN:
     print("\n--- GNN Embeddings ---")
-    train_gnn = create_gnn_embeddings(df_trans, train_pool_accts, train_cutoff)
-    test_gnn = create_gnn_embeddings(df_trans, test_accts, test_cutoff)
+    # Train GNN: EXCLUDE test accounts to prevent dynamic subgraph leakage
+    print("[TRAIN GNN] Building graph WITHOUT test accounts")
+    train_gnn = create_gnn_embeddings(df_trans, train_pool_accts, train_cutoff, excluded_accts=test_accts)
+
+    # Test GNN: Build separate graph for test accounts only
+    print("[TEST GNN] Building graph with ONLY test accounts")
+    test_gnn = create_gnn_embeddings(df_trans, test_accts, test_cutoff, excluded_accts=None)
 
     # Merge with static features
     train_features = train_features.join(train_gnn)
