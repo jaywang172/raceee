@@ -38,15 +38,30 @@ USE_GNN = True  # Set to False to test without GNN
 GNN_EPOCHS = 10
 GNN_HIDDEN_DIM = 64
 GNN_HEADS = 4
-BATCH_SIZE = 2048
+BATCH_SIZE = 4096  # Increased for multi-GPU
 N_FOLDS = 5
 RANDOM_SEED = 42
 
+# Multi-GPU support
+NUM_GPUS = torch.cuda.device_count() if torch.cuda.is_available() else 0
+USE_MULTI_GPU = NUM_GPUS > 1
+
 np.random.seed(RANDOM_SEED)
 torch.manual_seed(RANDOM_SEED)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed_all(RANDOM_SEED)
 
 print(f"Device: {DEVICE}")
+print(f"Number of GPUs: {NUM_GPUS}")
+print(f"Using Multi-GPU: {USE_MULTI_GPU}")
 print(f"Using GNN: {USE_GNN}")
+
+# GPU memory optimization
+if torch.cuda.is_available():
+    torch.backends.cudnn.benchmark = True
+    # Set memory allocation strategy
+    import os
+    os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
 
 # ============================================================================
 # DATA LOADING
@@ -207,6 +222,7 @@ def create_advanced_features(df_trans, accts, cutoff_date, for_training=True):
 def create_gnn_embeddings(df_trans, accts, cutoff_date):
     """
     Create GNN embeddings using ONLY structural features (NO labels!)
+    Memory-efficient version using mini-batch training
     """
     if not USE_GNN:
         print("GNN disabled, returning zero embeddings")
@@ -262,8 +278,8 @@ def create_gnn_embeddings(df_trans, accts, cutoff_date):
     print(f"Node features shape: {x.shape}")
     print(f"NO LABELS used in node features! ✅")
 
-    # Build PyG Data object
-    data = Data(x=x, edge_index=edge_index).to(DEVICE)
+    # Build PyG Data object (keep on CPU for now)
+    data = Data(x=x, edge_index=edge_index)
 
     # ========================================
     # GNN MODEL
@@ -283,45 +299,121 @@ def create_gnn_embeddings(df_trans, accts, cutoff_date):
 
     model = GNN(x.shape[1], GNN_HIDDEN_DIM, GNN_HIDDEN_DIM, heads=GNN_HEADS).to(DEVICE)
 
-    # Unsupervised training using link prediction
-    print("[GNN] Training with unsupervised link prediction...")
+    # Use DataParallel for multi-GPU training
+    if USE_MULTI_GPU:
+        print(f"[GNN] Using DataParallel across {NUM_GPUS} GPUs")
+        model = torch.nn.DataParallel(model)
+
+    # ========================================
+    # MINI-BATCH TRAINING WITH NEIGHBOR SAMPLING
+    # ========================================
+    print("[GNN] Training with mini-batch neighbor sampling...")
+
+    # Adjust batch size for multi-GPU
+    effective_batch_size = 1024 * max(1, NUM_GPUS // 2)  # Scale batch size with GPUs
+
+    # Create mini-batch loader with neighbor sampling
+    # Sample 15 neighbors per node in each layer
+    train_loader = NeighborLoader(
+        data,
+        num_neighbors=[15, 10, 5],  # 3-hop neighbors
+        batch_size=effective_batch_size,
+        shuffle=True,
+        num_workers=4,  # Use multiple workers for data loading
+    )
+
     optimizer = torch.optim.Adam(model.parameters(), lr=0.001, weight_decay=5e-4)
 
     model.train()
     for epoch in range(GNN_EPOCHS):
-        optimizer.zero_grad()
+        total_loss = 0
+        num_batches = 0
 
-        # Get embeddings
-        z = model(data.x, data.edge_index)
+        for batch in train_loader:
+            batch = batch.to(DEVICE)
+            optimizer.zero_grad()
 
-        # Link prediction loss (predict edges)
-        # Sample positive edges
-        pos_edge_idx = torch.randint(0, edge_index.shape[1], (min(10000, edge_index.shape[1]),))
-        pos_edges = edge_index[:, pos_edge_idx]
+            # Get embeddings for this batch
+            z = model(batch.x, batch.edge_index)
 
-        # Sample negative edges
-        neg_src = torch.randint(0, num_nodes, (pos_edges.shape[1],))
-        neg_dst = torch.randint(0, num_nodes, (pos_edges.shape[1],))
-        neg_edges = torch.stack([neg_src, neg_dst])
+            # Link prediction loss on sampled edges
+            # Use edges from the batch
+            if batch.edge_index.shape[1] > 0:
+                # Sample positive edges from batch
+                num_pos = min(500, batch.edge_index.shape[1])
+                pos_edge_idx = torch.randperm(batch.edge_index.shape[1])[:num_pos]
+                pos_edges = batch.edge_index[:, pos_edge_idx]
 
-        # Compute scores
-        pos_score = (z[pos_edges[0]] * z[pos_edges[1]]).sum(dim=1)
-        neg_score = (z[neg_edges[0]] * z[neg_edges[1]]).sum(dim=1)
+                # Sample negative edges within batch
+                batch_size = batch.num_nodes
+                neg_src = torch.randint(0, batch_size, (num_pos,), device=DEVICE)
+                neg_dst = torch.randint(0, batch_size, (num_pos,), device=DEVICE)
+                neg_edges = torch.stack([neg_src, neg_dst])
 
-        # BPR loss
-        loss = -F.logsigmoid(pos_score - neg_score).mean()
+                # Compute scores
+                pos_score = (z[pos_edges[0]] * z[pos_edges[1]]).sum(dim=1)
+                neg_score = (z[neg_edges[0]] * z[neg_edges[1]]).sum(dim=1)
 
-        loss.backward()
-        optimizer.step()
+                # BPR loss
+                loss = -F.logsigmoid(pos_score - neg_score).mean()
 
+                loss.backward()
+                optimizer.step()
+
+                total_loss += loss.item()
+                num_batches += 1
+
+            # Clear GPU cache periodically
+            if num_batches % 100 == 0:
+                torch.cuda.empty_cache()
+
+        avg_loss = total_loss / max(num_batches, 1)
         if (epoch + 1) % 2 == 0:
-            print(f"Epoch {epoch+1}/{GNN_EPOCHS}, Loss: {loss.item():.4f}")
+            print(f"Epoch {epoch+1}/{GNN_EPOCHS}, Avg Loss: {avg_loss:.4f}")
 
-    # Generate embeddings
-    print("[GNN] Generating final embeddings...")
+        torch.cuda.empty_cache()
+
+    # ========================================
+    # GENERATE EMBEDDINGS IN BATCHES
+    # ========================================
+    print("[GNN] Generating embeddings in batches...")
     model.eval()
+
+    # Larger batch size for inference with multi-GPU
+    inference_batch_size = 2048 * max(1, NUM_GPUS // 2)
+
+    # Create inference loader (larger batches, no sampling)
+    inference_loader = NeighborLoader(
+        data,
+        num_neighbors=[-1],  # Use all neighbors for final embedding
+        batch_size=inference_batch_size,
+        shuffle=False,
+        num_workers=4,
+    )
+
+    all_embeddings = []
+
     with torch.no_grad():
-        embeddings = model(data.x, data.edge_index).cpu().numpy()
+        for batch in tqdm(inference_loader, desc="Generating embeddings"):
+            batch = batch.to(DEVICE)
+
+            # Get embeddings for this batch
+            z = model(batch.x, batch.edge_index)
+
+            # Extract only the embeddings for the original batch nodes
+            # NeighborLoader includes neighbor nodes, we only want the batch root nodes
+            batch_size = batch.batch_size
+            z_batch = z[:batch_size]
+
+            all_embeddings.append(z_batch.cpu())
+
+            # Clear cache
+            torch.cuda.empty_cache()
+
+    # Concatenate all embeddings
+    embeddings = torch.cat(all_embeddings, dim=0).numpy()
+
+    print(f"Generated embeddings shape: {embeddings.shape}")
 
     embedding_df = pd.DataFrame(
         embeddings,
