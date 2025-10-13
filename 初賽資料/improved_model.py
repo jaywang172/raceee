@@ -34,7 +34,7 @@ print("="*80)
 # CONFIGURATION
 # ============================================================================
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-USE_GNN = True  # Set to False to test without GNN
+USE_GNN = False  # Disabled GNN to avoid complexity and potential leakage
 GNN_EPOCHS = 10
 GNN_HIDDEN_DIM = 64
 GNN_HEADS = 4
@@ -485,8 +485,10 @@ if USE_GNN:
     print("[TRAIN GNN] Building graph WITHOUT test accounts")
     train_gnn = create_gnn_embeddings(df_trans, train_pool_accts, train_cutoff, excluded_accts=test_accts)
 
-    # Test GNN: Build separate graph for test accounts only
-    print("[TEST GNN] Building graph with ONLY test accounts")
+    # Test GNN: Use FULL graph (including edges to training accounts)
+    # This is correct! We can see the network structure at prediction time
+    # We only prevent TRAINING-time leakage, not test-time information
+    print("[TEST GNN] Building graph with test accounts (using full graph structure)")
     test_gnn = create_gnn_embeddings(df_trans, test_accts, test_cutoff, excluded_accts=None)
 
     # Merge with static features
