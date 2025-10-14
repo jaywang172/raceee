@@ -33,7 +33,7 @@ print("="*80)
 N_FOLDS = 5
 RANDOM_SEED = 42
 USE_ENSEMBLE = True
-ADD_GRAPH_FEATURES = True
+ADD_GRAPH_FEATURES = False  # 關閉圖特徵以加速
 
 np.random.seed(RANDOM_SEED)
 
@@ -236,28 +236,31 @@ def add_graph_features(df_trans, accts, cutoff_date, features):
 
     print(f"Graph: {G.number_of_nodes():,} nodes, {G.number_of_edges():,} edges")
 
-    # Compute PageRank
+    # Compute PageRank (fast)
     print("  Computing PageRank...")
     try:
-        pagerank = nx.pagerank(G, max_iter=50)
+        pagerank = nx.pagerank(G, max_iter=20, tol=1e-3)
         features['pagerank'] = pd.Series(pagerank).reindex(accts).fillna(0)
     except:
         features['pagerank'] = 0
 
-    # Compute Betweenness Centrality (sampled for speed)
-    print("  Computing Betweenness...")
-    try:
-        sample_size = min(10000, G.number_of_nodes())
-        betweenness = nx.betweenness_centrality(G, k=sample_size)
-        features['betweenness'] = pd.Series(betweenness).reindex(accts).fillna(0)
-    except:
-        features['betweenness'] = 0
+    # Skip Betweenness - TOO SLOW for large graphs
+    # print("  Computing Betweenness...")
+    # betweenness = nx.betweenness_centrality(G, k=sample_size)
 
-    # Compute Clustering Coefficient
-    print("  Computing Clustering...")
+    # Compute Clustering Coefficient (on undirected graph)
+    print("  Computing Clustering (sampled)...")
     try:
-        clustering = nx.clustering(G.to_undirected())
-        features['clustering'] = pd.Series(clustering).reindex(accts).fillna(0)
+        # Only compute for target accounts (much faster)
+        G_undirected = G.to_undirected()
+        clustering_dict = {}
+        for acct in tqdm(accts[:100000], desc="  Clustering"):  # Limit to first 100k
+            if G_undirected.has_node(acct):
+                try:
+                    clustering_dict[acct] = nx.clustering(G_undirected, acct)
+                except:
+                    clustering_dict[acct] = 0
+        features['clustering'] = pd.Series(clustering_dict).reindex(accts).fillna(0)
     except:
         features['clustering'] = 0
 
